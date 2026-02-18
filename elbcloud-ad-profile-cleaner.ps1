@@ -12,6 +12,8 @@
 
   KEINE Zeitlogik, KEIN LastUseTime, KEIN NTUSER.DAT, KEINE Heuristiken.
 
+  Variante 2: Läuft auf Clients und Member-Servern, aber NICHT auf Domain Controllern.
+
 .NOTES
   Muss als SYSTEM oder Administrator laufen.
 #>
@@ -47,11 +49,14 @@ Write-Log "WhatIf: $WhatIf"
 # ---------------- OS & Domain Check ----------------
 try {
     $os = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop
-    if ($os.ProductType -ne 1) {
-        Write-Log "Server-OS erkannt – Skript wird nicht ausgeführt." "WARN"
+
+    # Variante 2: Domain Controller NICHT erlauben (ProductType 2)
+    if ($os.ProductType -eq 2) {
+        Write-Log "Domain Controller erkannt – Skript wird nicht ausgeführt." "WARN"
         exit 0
     }
 
+    # Clients (1) und Member Server (3) sind erlaubt
     $cs = Get-CimInstance Win32_ComputerSystem -ErrorAction Stop
     if (-not $cs.PartOfDomain) {
         Write-Log "Computer ist nicht domain-joined – Abbruch." "WARN"
@@ -114,7 +119,9 @@ try {
 $localSids = @()
 try {
     $localSids = (Get-LocalUser).SID.Value
-} catch {}
+} catch {
+    Write-Log "Hinweis: Get-LocalUser fehlgeschlagen. Lokale Konten werden primär über Domain-SID-Schranke geschützt." "WARN"
+}
 
 # ---------------- AD Lookup ----------------
 function Get-ADUserStateBySID {
@@ -127,29 +134,35 @@ function Get-ADUserStateBySID {
         $searcher.PropertiesToLoad.Add("userAccountControl") | Out-Null
 
         $r = $searcher.FindOne()
-        if (-not $r) { return @{ Found = $false } }
+        if (-not $r) { return @{ Found = $false; Enabled = $null; Sam = $null } }
 
-        $uac = [int]$r.Properties["useraccountcontrol"][0]
-        $enabled = -not ($uac -band 2)
-
-        return @{
-            Found   = $true
-            Enabled = $enabled
-            Sam     = $r.Properties["samaccountname"][0]
+        $uac = $null
+        $enabled = $null
+        if ($r.Properties["useraccountcontrol"].Count -gt 0) {
+            $uac = [int]$r.Properties["useraccountcontrol"][0]
+            $enabled = -not ($uac -band 2)
         }
+
+        $sam = $null
+        if ($r.Properties["samaccountname"].Count -gt 0) {
+            $sam = $r.Properties["samaccountname"][0]
+        }
+
+        return @{ Found = $true; Enabled = $enabled; Sam = $sam }
     } catch {
         Write-Log "LDAP Fehler bei SID $SID – Abbruch." "ERROR"
         exit 0
     }
 }
 
-# ---------------- Profile Loop ----------------
+# ---------------- Profile Loop (WMI, robust) ----------------
 $profiles = Get-WmiObject Win32_UserProfile | Where-Object {
     -not $_.Special -and $_.LocalPath
 }
 
 $deleted = 0
 $skipped = 0
+$errors  = 0
 
 foreach ($p in $profiles) {
     $sid  = $p.SID
@@ -163,18 +176,28 @@ foreach ($p in $profiles) {
         continue
     }
 
+    # Lokale User-SIDs (wenn ermittelbar)
     if ($localSids -contains $sid) {
         Write-Log "Lokaler Benutzer – übersprungen."
         $skipped++
         continue
     }
 
+    # AzureAD/Entra
     if ($sid -like "S-1-12-*") {
-        Write-Log "AzureAD SID – übersprungen."
+        Write-Log "AzureAD/Entra SID – übersprungen."
         $skipped++
         continue
     }
 
+    # System
+    if ($sid -in @("S-1-5-18","S-1-5-19","S-1-5-20")) {
+        Write-Log "System-SID – übersprungen."
+        $skipped++
+        continue
+    }
+
+    # Harte Schranke: nur Domain-SIDs
     if ($sid -notlike "$domainSidPrefix-*") {
         Write-Log "Nicht Domain-SID – übersprungen."
         $skipped++
@@ -189,27 +212,34 @@ foreach ($p in $profiles) {
         continue
     }
 
-    Write-Log "MARKIERT ZUM LÖSCHEN: $($ad.Sam)" "WARN"
+    $reason = if (-not $ad.Found) { "AD-User nicht gefunden" } else { "AD-User deaktiviert: $($ad.Sam)" }
+    Write-Log "MARKIERT ZUM LÖSCHEN: $reason" "WARN"
 
     if ($WhatIf) {
+        Write-Log "[WHATIF] Würde Profil löschen: $path" "INFO"
         $deleted++
         continue
     }
 
     try {
-        $p.Delete() | Out-Null
-        Write-Log "Profil via WMI gelöscht."
+        $rv = $p.Delete()
+        Write-Log "Profil via WMI gelöscht. ReturnValue=$rv" "SUCCESS"
+
         if (Test-Path $path) {
-            Remove-Item $path -Recurse -Force -ErrorAction Stop
-            Write-Log "Ordner-Fallback erfolgreich."
+            Write-Log "Fallback: Profilordner existiert noch – Remove-Item." "WARN"
+            Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction Stop
+            Write-Log "Fallback-Ordnerlöschung erfolgreich." "SUCCESS"
         }
+
         $deleted++
     } catch {
-        Write-Log "FEHLER beim Löschen $path : $_" "ERROR"
+        Write-Log "FEHLER beim Löschen $path : $($_.Exception.Message)" "ERROR"
+        $errors++
     }
 }
 
 Write-Log "=== Fertig ==="
 Write-Log "Gelöscht: $deleted"
 Write-Log "Übersprungen: $skipped"
+Write-Log "Fehler: $errors"
 Write-Log "Logdatei: $LogPath"
